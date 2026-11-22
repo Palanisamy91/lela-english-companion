@@ -167,20 +167,39 @@ const GROUP_LABELS: Record<string, string> = {
     @if (lela.active()) {
       <section class="controls card" aria-label="Controls">
         @if (lela.error()) { <p class="notice warn" role="alert" data-testid="error">{{ lela.error() }}</p> }
-        @if (lela.phase() === 'listening' && !lela.liveMode()) {
-          <div class="live" role="status" data-testid="listening"><span class="rings"><app-icon name="mic" [size]="18" /></span><div class="live-text"><strong>Listening… speak now</strong>@if (lela.speech.heardFinal()) { <p class="fin" data-testid="final-text"><span class="tag">Heard</span> {{ lela.speech.heardFinal() }}</p> }@if (lela.speech.interim() && lela.speech.interim() !== lela.speech.heardFinal()) { <p class="int" data-testid="interim-text"><span class="tag">Hearing</span> {{ lela.speech.interim() }}</p> }</div></div>
+
+        @if (!lela.liveMode() && (lela.phase() === 'listening' || lela.speech.heardFinal() || lela.speech.interim())) {
+          <div class="live" role="status" data-testid="listening">
+            <span class="rings"><app-icon name="mic" [size]="18" /></span>
+            <div class="live-text">
+              <strong>Listening… speak now</strong>
+              @if (lela.speech.heardFinal()) {
+                <p class="fin" data-testid="final-text"><span class="tag">Heard</span> {{ lela.speech.heardFinal() }}</p>
+              }
+              @if (lela.speech.interim() && lela.speech.interim() !== lela.speech.heardFinal()) {
+                <p class="int" data-testid="interim-text"><span class="tag">Hearing</span> {{ lela.speech.interim() }}</p>
+              }
+            </div>
+          </div>
         }
+
         @if (lela.liveMode()) {
           <div class="live" role="status" data-testid="live-panel">
             <span class="rings" [class.on]="lela.speech.isListening()"><app-icon name="mic" [size]="18" /></span>
             <div class="live-text">
               <strong data-testid="live-state">{{ liveState() }}</strong>
-              @if (lela.speech.isListening() && (lela.speech.interim() || lela.speech.heardFinal())) { <p class="int" data-testid="live-transcript"><span class="tag">You</span> {{ lela.speech.interim() || lela.speech.heardFinal() }}</p> }
+              @if (lela.speech.heardFinal()) {
+                <p class="int" data-testid="live-transcript"><span class="tag">You</span> {{ lela.speech.heardFinal() }}</p>
+              }
+              @if (lela.speech.interim()) {
+                <p class="int" data-testid="interim-transcript"><span class="tag">Hearing</span> {{ lela.speech.interim() }}</p>
+              }
               @if (lela.livePaused()) { <p class="small" data-testid="live-paused">Listening paused after a long silence. Your conversation is saved. <button type="button" class="btn small" (click)="lela.tapMic()" data-testid="live-resume">Continue listening</button></p> }
               <button type="button" class="btn small" [disabled]="lela.phase() !== 'speaking'" (click)="lela.stopSpeaking()" data-testid="interrupt"><app-icon name="stop" [size]="16" /> Interrupt Lela</button>
             </div>
           </div>
         }
+
         <form class="merged-composer" (submit)="onSubmit($event, box)">
           <button type="button" class="merge-btn speak-btn" [class.on]="lela.phase() === 'listening'" [disabled]="!lela.canListen || !lela.micOn()" (click)="lela.tapMic()" aria-label="Speak" data-testid="mic"><app-icon name="mic" [size]="17" /><span>Speak</span></button>
           <button type="button" class="merge-btn retry-btn" [disabled]="!lela.canListen || !lela.micOn() || lela.phase() === 'listening'" (click)="lela.tapMic()" aria-label="Retry listening" data-testid="retry"><app-icon name="replay" [size]="16" /><span>Retry</span></button>
@@ -369,6 +388,7 @@ const GROUP_LABELS: Record<string, string> = {
 export class LelaComponent implements OnInit, OnDestroy, AfterViewChecked {
   readonly lela = inject(LelaConversationService);
   readonly progress = inject(ProgressService);
+
   /** One line for the Live panel: what is happening right now. */
   readonly liveState = computed(() => {
     if (this.lela.livePaused()) return 'Paused';
@@ -376,6 +396,7 @@ export class LelaComponent implements OnInit, OnDestroy, AfterViewChecked {
     if (this.lela.phase() === 'thinking') return 'Thinking…';
     return this.lela.speech.isListening() ? 'Listening — speak any time' : 'Your turn';
   });
+
   @ViewChild('scrollBox') private scrollBox?: ElementRef<HTMLElement>;
 
   readonly showVoice = signal(false);
@@ -422,6 +443,7 @@ export class LelaComponent implements OnInit, OnDestroy, AfterViewChecked {
       });
       this.watcher.observe(el, { childList: true, subtree: true, characterData: true });
     }
+
     // Scroll to the newest message when one is added, and also when the "typing" dots appear or go away.
     const list = this.lela.messages();
     const key = (list.length > 0 ? list[list.length - 1].id : 0) * 2 + (this.lela.phase() === 'thinking' ? 1 : 0);
@@ -429,8 +451,6 @@ export class LelaComponent implements OnInit, OnDestroy, AfterViewChecked {
       this.shown = key;
       const box = this.scrollBox?.nativeElement;
       if (box) {
-        // Setting scrollTop is animated smoothly by the CSS (scroll-behavior: smooth on the chat box).
-        // It is done again after the new content has been laid out, because bubbles can grow a little.
         const down = (): void => box.scrollTo({ top: box.scrollHeight, behavior: 'instant' as ScrollBehavior });
         down();
         clearTimeout(this.followTimer);
