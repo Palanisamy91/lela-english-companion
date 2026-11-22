@@ -1,0 +1,102 @@
+
+name: Lela companion
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'public/**'
+      - 'scripts/**'
+      - 'data-src/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'angular.json'
+      - 'capacitor.config.ts'
+      - '.github/workflows/build-android-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Download source code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Install Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 3. Install Java
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # 4. Install project dependencies
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      # 5. Validate project data
+      - name: Check project data
+        run: |
+          npm run data:check
+          npm run db:check
+
+      # 6. Build Angular application
+      - name: Build Angular app
+        run: npm run build
+
+      # 7. Verify Angular build output
+      - name: Verify web build
+        run: |
+          test -f dist/my-english-buddy/browser/index.html
+
+      # 8. Generate Android project
+      - name: Generate Android project
+        run: npx cap add android
+
+      # 9. Generate Android app icon
+      - name: Generate Android assets
+        run: npx capacitor-assets generate --android
+
+      # 10. Configure Android permissions
+      - name: Configure Android permissions
+        run: npm run android:setup
+
+      # 11. Sync Capacitor
+      - name: Sync Android project
+        run: npx cap sync android
+
+      # 12. Build APK
+      - name: Build debug APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      # 13. Verify APK
+      - name: Verify APK
+        run: |
+          test -f android/app/build/outputs/apk/debug/app-debug.apk
+
+      # 14. Upload APK
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lela-English-Companion-APK
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
