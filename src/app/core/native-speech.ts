@@ -1,3 +1,4 @@
+
 import { Capacitor } from '@capacitor/core';
 import { SpeechRecognition } from '@capacitor-community/speech-recognition';
 import { AndroidSettings, NativeSettings } from 'capacitor-native-settings';
@@ -40,27 +41,32 @@ export async function openNativeAppSettings(): Promise<boolean> {
   }
 }
 
-// A small adapter that makes the Capacitor recogniser look like the browser
-// SpeechRecognition API expected by SpeechService.
 interface AltLike {
   transcript: string;
   confidence: number;
 }
+
 interface ResultLike {
   readonly isFinal: boolean;
   readonly length: number;
   [index: number]: AltLike;
 }
+
 interface EventLike {
   resultIndex: number;
   results: ArrayLike<ResultLike>;
 }
 
+/**
+ * Android speech recognition adapter.
+ * Keeps completed phrase segments across Android recognition sessions.
+ * Delivers one final transcript when the learner stops or is silent.
+ */
 export class NativeRecognition {
   lang = 'en-IN';
   interimResults = true;
   maxAlternatives = 3;
-  continuous = false;
+  continuous = true;
 
   onstart: (() => void) | null = null;
   onresult: ((event: EventLike) => void) | null = null;
@@ -69,89 +75,280 @@ export class NativeRecognition {
 
   private handles: Array<{ remove: () => Promise<void> }> = [];
   private matches: string[] = [];
-  private ended = false;
+  private completedText = '';
+
+  private ended = true;
   private aborted = false;
   private started = false;
   private startSignalled = false;
+  private stopRequested = false;
+
+  private restartCount = 0;
+  private restartTimer?: ReturnType<typeof setTimeout>;
+  private phraseTimer?: ReturnType<typeof setTimeout>;
   private stopTimer?: ReturnType<typeof setTimeout>;
 
-  /** Starts one native recognition session. The caller may start another after onend. */
+  /** Wait four seconds after the last completed phrase before finalising. */
+  private readonly silenceWaitMs = 4000;
+
   start(): void {
     if (!this.ended && this.started) return;
+
     this.ended = false;
     this.aborted = false;
     this.started = true;
     this.startSignalled = false;
+    this.stopRequested = false;
+    this.restartCount = 0;
+    this.completedText = '';
     this.matches = [];
-    void this.run();
+
+    clearTimeout(this.restartTimer);
+    clearTimeout(this.phraseTimer);
+    clearTimeout(this.stopTimer);
+
+    void this.runSession();
   }
 
-  /** Stops the current phrase and returns its latest recognised text as final. */
+  /** Stops and returns all text captured across Android recognition sessions. */
   stop(): void {
-    if (this.ended || this.aborted) return;
-    clearTimeout(this.stopTimer);
+    if (this.ended || this.aborted || this.stopRequested) return;
+
+    this.stopRequested = true;
+
+    clearTimeout(this.restartTimer);
+    clearTimeout(this.phraseTimer);
+
     void SpeechRecognition.stop().catch(() => undefined);
-    // Some Android recognition services fail to send the stopped event.
-    this.stopTimer = setTimeout(() => this.finish(), 1800);
+
+    // Fallback for Android services that do not report listeningState=stopped.
+    this.stopTimer = setTimeout(() => this.finish(), 1500);
   }
 
   /** Cancels without delivering a final transcript. */
   abort(): void {
     if (this.ended || this.aborted) return;
+
     this.aborted = true;
+
+    clearTimeout(this.restartTimer);
+    clearTimeout(this.phraseTimer);
     clearTimeout(this.stopTimer);
+
     void SpeechRecognition.stop().catch(() => undefined);
     this.cleanup();
   }
 
-  private async run(): Promise<void> {
+  private async runSession(): Promise<void> {
+    if (this.ended || this.aborted || this.stopRequested) return;
+
     try {
       const availability = await SpeechRecognition.available();
-      if (this.aborted || this.ended) return;
-      if (!availability.available) return this.fail('service-not-allowed');
+
+      if (this.aborted || this.ended || this.stopRequested) return;
+
+      if (!availability.available) {
+        this.fail('service-not-allowed');
+        return;
+      }
 
       const before = (await SpeechRecognition.checkPermissions()).speechRecognition;
-      if (this.aborted || this.ended) return;
+
+      if (this.aborted || this.ended || this.stopRequested) return;
+
       const plan = permissionPlan(before);
-      if (plan === 'settings') return this.fail('not-allowed-permanent');
+
+      if (plan === 'settings') {
+        this.fail('not-allowed-permanent');
+        return;
+      }
 
       if (plan === 'ask') {
         const after = (await SpeechRecognition.requestPermissions()).speechRecognition;
-        if (this.aborted || this.ended) return;
+
+        if (this.aborted || this.ended || this.stopRequested) return;
+
         const outcome = outcomeAfterRequest(after);
-        if (outcome === 'settings') return this.fail('not-allowed-permanent');
-        if (outcome === 'ask-again') return this.fail('not-allowed');
+
+        if (outcome === 'settings') {
+          this.fail('not-allowed-permanent');
+          return;
+        }
+
+        if (outcome === 'ask-again') {
+          this.fail('not-allowed');
+          return;
+        }
       }
 
-      const partialHandle = await SpeechRecognition.addListener('partialResults', (data: { matches?: string[] }) => {
-        if (this.aborted || this.ended) return;
-        // `matches` are alternative hypotheses for the SAME phrase, not separate chunks.
-        // Keep the latest set; SpeechService/transcript.ts chooses one alternative.
-        this.matches = Array.isArray(data?.matches)
-          ? data.matches.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
-          : [];
-        this.emit(false);
-      });
+      const partialHandle = await SpeechRecognition.addListener(
+        'partialResults',
+        (data: { matches?: string[] }) => {
+          if (this.aborted || this.ended || this.stopRequested) return;
+
+          const candidates = Array.isArray(data?.matches)
+            ? data.matches.filter(
+                (item): item is string =>
+                  typeof item === 'string' && item.trim().length > 0
+              )
+            : [];
+
+          if (candidates.length === 0) return;
+
+          const incoming = candidates[0].replace(/\s+/g, ' ').trim();
+          const previous = this.matches[0] ?? '';
+
+          const a = previous.toLocaleLowerCase();
+          const b = incoming.toLocaleLowerCase();
+
+          // Android may send revised versions of the same phrase.
+          // Keep the fuller version instead of duplicating the words.
+          const chosen =
+            a && (a === b || a.startsWith(b + ' '))
+              ? previous
+              : b && (b === a || b.startsWith(a + ' '))
+                ? incoming
+                : incoming;
+
+          this.matches = [chosen, ...candidates.slice(1)];
+
+          // New speech means the silence period must start again.
+          clearTimeout(this.phraseTimer);
+
+          this.emit(false);
+        }
+      );
+
       this.handles.push(partialHandle);
 
-      const stateHandle = await SpeechRecognition.addListener('listeningState', (data: { status?: string }) => {
-        if (this.aborted || this.ended) return;
-        if (data?.status === 'started') this.signalStart();
-        if (data?.status === 'stopped') this.finish();
-      });
+      const stateHandle = await SpeechRecognition.addListener(
+        'listeningState',
+        (data: { status?: string }) => {
+          if (this.aborted || this.ended) return;
+
+          if (data?.status === 'started') {
+            clearTimeout(this.phraseTimer);
+            this.signalStart();
+          }
+
+          if (data?.status === 'stopped') {
+            this.onNativeSessionStopped();
+          }
+        }
+      );
+
       this.handles.push(stateHandle);
 
-      if (this.aborted || this.ended) return this.cleanup();
+      if (this.aborted || this.ended || this.stopRequested) {
+        this.cleanup();
+        return;
+      }
+
       await SpeechRecognition.start({
         language: this.lang || 'en-IN',
         maxResults: Math.max(1, Math.min(5, this.maxAlternatives || 1)),
         partialResults: this.interimResults,
         popup: false
       });
-      if (!this.aborted && !this.ended) this.signalStart();
+
+      if (!this.aborted && !this.ended && !this.stopRequested) {
+        this.signalStart();
+      }
     } catch (error) {
-      if (!this.aborted && !this.ended) this.fail(nativeErrorCode(error));
+      if (!this.aborted && !this.ended && !this.stopRequested) {
+        this.fail(nativeErrorCode(error));
+      } else if (this.stopRequested) {
+        this.finish();
+      }
     }
+  }
+
+  private onNativeSessionStopped(): void {
+    if (this.ended || this.aborted) return;
+
+    if (this.stopRequested) {
+      this.finish();
+      return;
+    }
+
+    this.commitCurrentSegment();
+    this.removeSessionListeners();
+
+    if (!this.completedText.trim()) {
+      this.restartCount++;
+
+      if (this.restartCount > 4) {
+        this.fail('no-speech');
+        return;
+      }
+    } else {
+      this.restartCount = 0;
+
+      // Allow the learner time to continue the same sentence.
+      clearTimeout(this.phraseTimer);
+      this.phraseTimer = setTimeout(() => {
+        if (!this.ended && !this.aborted && !this.stopRequested) {
+          this.finish();
+        }
+      }, this.silenceWaitMs);
+    }
+
+    clearTimeout(this.restartTimer);
+
+    // Restart quickly so the next part of the sentence is not missed.
+    this.restartTimer = setTimeout(() => {
+      if (!this.ended && !this.aborted && !this.stopRequested) {
+        void this.runSession();
+      }
+    }, 250);
+  }
+
+  private mergeText(previous: string, incoming: string): string {
+    const a = previous.replace(/\s+/g, ' ').trim();
+    const b = incoming.replace(/\s+/g, ' ').trim();
+
+    if (!b) return a;
+    if (!a) return b;
+
+    const lowerA = a.toLocaleLowerCase();
+    const lowerB = b.toLocaleLowerCase();
+
+    if (lowerA === lowerB || lowerA.endsWith(` ${lowerB}`)) return a;
+    if (lowerB.startsWith(`${lowerA} `)) return b;
+    if (lowerA.startsWith(`${lowerB} `)) return a;
+
+    const aWords = a.split(' ');
+    const bWords = b.split(' ');
+    const max = Math.min(aWords.length, bWords.length);
+
+    // Avoid repeating overlapping words between two Android sessions.
+    for (let count = max; count > 0; count--) {
+      const left = aWords
+        .slice(-count)
+        .join(' ')
+        .toLocaleLowerCase();
+
+      const right = bWords
+        .slice(0, count)
+        .join(' ')
+        .toLocaleLowerCase();
+
+      if (left === right) {
+        return [...aWords, ...bWords.slice(count)].join(' ');
+      }
+    }
+
+    return `${a} ${b}`;
+  }
+
+  private commitCurrentSegment(): void {
+    const current = this.matches[0]?.trim();
+
+    if (current) {
+      this.completedText = this.mergeText(this.completedText, current);
+    }
+
+    this.matches = [];
   }
 
   private signalStart(): void {
@@ -162,40 +359,77 @@ export class NativeRecognition {
   }
 
   private emit(isFinal: boolean): void {
-    if (this.aborted || this.ended || this.matches.length === 0) return;
+    if (this.aborted || this.ended) return;
+
+    const current = this.matches[0] ?? '';
+
+    const transcript = isFinal
+      ? this.completedText || current
+      : this.mergeText(this.completedText, current);
+
+    if (!transcript.trim()) return;
+
     const result: ResultLike = {
       isFinal,
-      length: this.matches.length,
-      ...Object.fromEntries(
-        this.matches.slice(0, Math.max(1, this.maxAlternatives)).map((transcript, index) => [
-          index,
-          { transcript, confidence: 0 }
-        ])
-      )
+      length: 1,
+      0: {
+        transcript,
+        confidence: 0
+      }
     };
-    this.onresult?.({ resultIndex: 0, results: [result] });
+
+    this.onresult?.({
+      resultIndex: 0,
+      results: [result]
+    });
   }
 
   private finish(): void {
     if (this.ended || this.aborted) return;
+
+    clearTimeout(this.restartTimer);
+    clearTimeout(this.phraseTimer);
     clearTimeout(this.stopTimer);
-    if (this.matches.length) this.emit(true);
+
+    this.commitCurrentSegment();
+
+    if (this.completedText.trim()) {
+      this.matches = [this.completedText];
+      this.emit(true);
+    }
+
     this.ended = true;
+    this.started = false;
+
     this.cleanup();
     this.onend?.();
   }
 
   private fail(code: string): void {
     if (this.ended || this.aborted) return;
+
     this.ended = true;
+    this.started = false;
+
     this.cleanup();
+
     this.onerror?.({ error: code });
     this.onend?.();
   }
 
-  private cleanup(): void {
-    clearTimeout(this.stopTimer);
+  private removeSessionListeners(): void {
     const handles = this.handles.splice(0);
-    for (const handle of handles) void handle.remove().catch(() => undefined);
+
+    for (const handle of handles) {
+      void handle.remove().catch(() => undefined);
+    }
+  }
+
+  private cleanup(): void {
+    clearTimeout(this.restartTimer);
+    clearTimeout(this.phraseTimer);
+    clearTimeout(this.stopTimer);
+
+    this.removeSessionListeners();
   }
 }

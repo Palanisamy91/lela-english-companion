@@ -1,3 +1,4 @@
+
 import { NgTemplateOutlet } from '@angular/common';
 import { AfterViewChecked, Component, ElementRef, OnDestroy, OnInit, ViewChild, computed, inject, signal } from '@angular/core';
 import { ProgressService } from '../core/progress.service';
@@ -40,9 +41,6 @@ const GROUP_LABELS: Record<string, string> = {
         {{ lela.loadError() }}
         <button type="button" class="btn small" (click)="lela.load()">Try again</button>
       </div>
-    }
-    @if (lela.canSpeak && lela.speech.voices().length > 0 && lela.voiceChoice().gender !== 'female') {
-      <p class="notice warn" role="status" data-testid="voice-warning">{{ lela.voiceChoice().note }} Open Voice settings to see the voices on this device.</p>
     }
     <app-mic-help />
     @if (lela.canListen === false) {
@@ -154,7 +152,6 @@ const GROUP_LABELS: Record<string, string> = {
           </div>
         }
       </section>
-
     }
 
     @if (viewing(); as v) {
@@ -219,7 +216,6 @@ const GROUP_LABELS: Record<string, string> = {
         }
       </section>
     }
-
 
     <ng-template #liveSwitch>
       <fieldset class="live-switch" data-testid="live-switch">
