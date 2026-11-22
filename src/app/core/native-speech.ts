@@ -88,10 +88,12 @@ export class NativeRecognition {
   private phraseTimer?: ReturnType<typeof setTimeout>;
   private stopTimer?: ReturnType<typeof setTimeout>;
   private startTimer?: ReturnType<typeof setTimeout>;
+  private sessionResultTimer?: ReturnType<typeof setTimeout>;
 
   private readonly silenceWaitMs = 4000;
   private readonly restartWaitMs = 300;
   private readonly startTimeoutMs = 10000;
+  private readonly finalResultWaitMs = 1200;
 
   start(): void {
     if (!this.ended && this.started) {
@@ -124,10 +126,13 @@ export class NativeRecognition {
     clearTimeout(this.restartTimer);
     clearTimeout(this.phraseTimer);
     clearTimeout(this.startTimer);
+    clearTimeout(this.sessionResultTimer);
+
+    this.sessionResultTimer = undefined;
 
     void SpeechRecognition.stop().catch(() => undefined);
 
-    // Allow Android time to deliver its last partial result.
+    // Keep listeners active while Android delivers its final result.
     this.stopTimer = setTimeout(() => {
       this.finish();
     }, 1500);
@@ -214,7 +219,7 @@ export class NativeRecognition {
         }
       }
 
-      // Listen for Android partial speech results.
+      // Receive Android partial and final recognition results.
       const partialHandle = await SpeechRecognition.addListener(
         'partialResults',
         (data: { matches?: string[] }) => {
@@ -248,7 +253,7 @@ export class NativeRecognition {
 
           let chosen = incoming;
 
-          // Android can revise the same partial sentence.
+          // Android may revise the same partial sentence.
           if (a && b) {
             if (a === b || a.startsWith(b + ' ')) {
               chosen = previous;
@@ -259,11 +264,10 @@ export class NativeRecognition {
 
           this.matches = [chosen];
 
-          // New speech means the silence period has ended.
           clearTimeout(this.phraseTimer);
           this.phraseTimer = undefined;
 
-          // Show the complete live sentence.
+          // Show the latest recognised sentence.
           this.emit(false);
         }
       );
@@ -276,7 +280,7 @@ export class NativeRecognition {
         return;
       }
 
-      // Listen for actual Android microphone state.
+      // Listen for Android microphone state.
       const stateHandle = await SpeechRecognition.addListener(
         'listeningState',
         (data: { status?: string }) => {
@@ -302,7 +306,6 @@ export class NativeRecognition {
         return;
       }
 
-      // Do not show Listening until Android confirms the microphone started.
       clearTimeout(this.startTimer);
 
       this.startTimer = setTimeout(() => {
@@ -327,8 +330,7 @@ export class NativeRecognition {
         popup: false
       });
 
-      // Do not signal onstart just because start() returned.
-      // Wait for Android's listeningState: started event.
+      // Wait for Android listeningState: started.
     } catch (error) {
       this.sessionRunning = false;
 
@@ -351,46 +353,60 @@ export class NativeRecognition {
     this.startTimer = undefined;
 
     if (this.stopRequested) {
-      // Let any last partial result arrive before finishing.
+      // Keep the partial-results listener until finish().
       if (!this.stopTimer) {
         this.stopTimer = setTimeout(() => {
           this.finish();
-        }, 500);
+        }, 1500);
       }
       return;
     }
 
-    this.commitCurrentSegment();
-    this.removeSessionListeners();
+    // Android can send onResults() after onEndOfSpeech().
+    // Wait before committing the current partial sentence.
+    clearTimeout(this.sessionResultTimer);
 
-    if (!this.completedText.trim()) {
-      this.restartCount++;
+    this.sessionResultTimer = setTimeout(() => {
+      this.sessionResultTimer = undefined;
 
-      if (this.restartCount > 4) {
-        this.fail('no-speech');
+      if (!this.canContinue()) {
         return;
       }
-    } else {
-      this.restartCount = 0;
 
-      // Start the silence timer only once.
-      // A new partial result cancels it.
-      if (!this.phraseTimer) {
-        this.phraseTimer = setTimeout(() => {
-          if (!this.ended && !this.aborted && !this.stopRequested) {
-            this.finish();
-          }
-        }, this.silenceWaitMs);
+      // Commit after allowing time for the final Android result.
+      this.commitCurrentSegment();
+
+      // Remove listeners only after the final-result waiting period.
+      this.removeSessionListeners();
+
+      if (!this.completedText.trim()) {
+        this.restartCount++;
+
+        if (this.restartCount > 4) {
+          this.fail('no-speech');
+          return;
+        }
+      } else {
+        this.restartCount = 0;
+
+        if (!this.phraseTimer) {
+          this.phraseTimer = setTimeout(() => {
+            if (!this.ended && !this.aborted && !this.stopRequested) {
+              this.finish();
+            }
+          }, this.silenceWaitMs);
+        }
       }
-    }
 
-    clearTimeout(this.restartTimer);
+      clearTimeout(this.restartTimer);
 
-    this.restartTimer = setTimeout(() => {
-      if (this.canContinue()) {
-        void this.runSession();
-      }
-    }, this.restartWaitMs);
+      this.restartTimer = setTimeout(() => {
+        if (this.canContinue()) {
+          void this.runSession();
+        }
+      }, this.restartWaitMs);
+
+    }, this.finalResultWaitMs);
   }
 
   private mergeText(previous: string, incoming: string): string {
@@ -462,7 +478,6 @@ export class NativeRecognition {
 
     this.matches = [];
 
-    // Keep the accumulated sentence visible.
     this.emit(false);
   }
 
@@ -564,11 +579,13 @@ export class NativeRecognition {
     clearTimeout(this.phraseTimer);
     clearTimeout(this.stopTimer);
     clearTimeout(this.startTimer);
+    clearTimeout(this.sessionResultTimer);
 
     this.restartTimer = undefined;
     this.phraseTimer = undefined;
     this.stopTimer = undefined;
     this.startTimer = undefined;
+    this.sessionResultTimer = undefined;
   }
 
   private removeSessionListeners(): void {
